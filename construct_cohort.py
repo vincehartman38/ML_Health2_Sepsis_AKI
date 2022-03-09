@@ -36,7 +36,7 @@ def develops_aki(dataset: list, patients: list) -> list:
                     ):
                         # save the values
                         aki_patients.append(patients[i])
-                        aki_data = [row[: (j + 1)] for row in patient_data]
+                        aki_data = [row[:j] for row in patient_data]
                         aki_dataset.append(aki_data)
                         break
     return aki_patients, aki_dataset
@@ -76,9 +76,9 @@ def main():
     # save cohorts
     print("Saving aki and sepsis cohorts")
     load_and_save.create_txt("./results/features.txt", features)
-    load_and_save.create_txt("./results/aki_patients.txt", aki_patients)
+    load_and_save.create_pickle("./results/aki_patients.pickle", aki_patients)
     load_and_save.create_pickle("./results/aki_cohort.pickle", aki_cohort)
-    load_and_save.create_txt("./results/sepsis_patients.txt", sepsis_patients)
+    load_and_save.create_pickle("./results/sepsis_patients.pickle", sepsis_patients)
     load_and_save.create_pickle("./results/sepsis_cohort.pickle", sepsis_cohort)
     print("Done. Files are saved in results directory.")
 
