@@ -16,6 +16,7 @@ warnings.filterwarnings("ignore", r"Mean of empty slice")
 
 rpy2.robjects.numpy2ri.activate()
 NbClust = importr("NbClust")
+rstats = importr("stats")
 
 
 def convert_rvector(vec):
@@ -211,8 +212,15 @@ def sepsis_feature_extraction(dataset: list, patients: list):
 
 
 def sepsis_identify_clusters(dataset: list):
-    diss = dtw(dataset)
-    print(diss)
+    patients_n = len(dataset)
+    dtw_matrix = np.empty((patients_n, patients_n))
+    for i, temps_i in enumerate(dataset):
+        for j, temps_j in enumerate(dataset):
+            dtw_matrix[i, j] = dtw(temps_i, temps_j)
+    load_and_save.create_csv("./results/distance_matrix.csv", dtw_matrix)
+
+    # dtw_matrix = load_and_save.read_csv("./results/distance_matrix.csv", False)
+    # dtw_matrix = np.array(dtw_matrix, dtype=np.float64)
     indexes = [
         "ptbiserial",
         "frey",
@@ -228,8 +236,8 @@ def sepsis_identify_clusters(dataset: list):
     num_clusters = []
     f = ro.r(
         """
-        f<-function(data, diss, index){
-            NbClust(data, diss=diss, min.nc=2, max.nc=8, method="complete", index=index)
+        f<-function(data, d, index){
+            NbClust(data, diss=as.dist(d), distance=NULL, min.nc=2, max.nc=8, method="complete", index=index)
             }
         """
     )
@@ -238,28 +246,35 @@ def sepsis_identify_clusters(dataset: list):
     nr, nc = np_data.shape
     np_data_scaled = MinMaxScaler().fit_transform(np_data)
     # convert dataset to r matrix
-    r_vec = ro.FloatVector(np_data_scaled.transpose().reshape((np_data_scaled.size)))
-    r_data = ro.r.matrix(r_vec, nrow=nr, ncol=nc)
+    r_data_vec = ro.FloatVector(
+        np_data_scaled.transpose().reshape((np_data_scaled.size))
+    )
+    r_data = ro.r.matrix(r_data_vec, nrow=nr, ncol=nc)
     # convert diss to r matrix
-
+    dr, dc = dtw_matrix.shape
+    r_diss_vec = ro.FloatVector(dtw_matrix.transpose().reshape((dtw_matrix.size)))
+    r_diss = ro.r.matrix(r_diss_vec, nrow=dr, ncol=dc)
     for ind in indexes:
-        num_clusters.append(int(convert_rvector(f(r_data, diss, ind))["Best.nc"][0]))
+        num_clusters.append(int(convert_rvector(f(r_data, r_diss, ind))["Best.nc"][0]))
     indexes.append("majority")
-    majority = stats.mode(num_clusters)[0]
+    majority = stats.mode(num_clusters)[0][0]
     num_clusters.append(majority)
     values = np.hstack((np.c_[indexes], np.c_[num_clusters]))
     table = np.vstack((["index", "num_clusters"], values))
-    return majority, table
+    return (
+        majority,
+        dtw_matrix,
+        table,
+    )
 
 
-def sepsis_agglomerative_clusters(dataset: list, patients: list, optimal_majority: int):
-    np_data = np.array(dataset, dtype=np.float64)
-    # Normalize data
-    np_data_scaled = MinMaxScaler().fit_transform(np_data)
+def sepsis_agglomerative_clusters(
+    distances: list, patients: list, optimal_majority: int
+):
     # AgglomerativeClustering
     agglomerative = AgglomerativeClustering(
         n_clusters=optimal_majority, linkage="complete", affinity="precomputed"
-    ).fit(np_data_scaled)
+    ).fit(distances)
     agglomerative_labels = agglomerative.labels_
     table_clusters = [["id"] + ["cluster_" + str(x) for x in range(optimal_majority)]]
     for i, pid in enumerate(patients):
@@ -273,8 +288,39 @@ def sepsis_agglomerative_clusters(dataset: list, patients: list, optimal_majorit
     return agglomerative_labels, table_clusters
 
 
-def sepsis_statistical_analysis():
-    return None
+def sepsis_statistical_analysis(
+    dataset: list,
+    features: list,
+    kmeans_labels: list,
+    optimal_cluster: int,
+):
+
+    table_cluster_header = (
+        ["feature"]
+        + [
+            "cluster_" + str(x) + "_" + y
+            for x in range(optimal_cluster)
+            for y in ["mean", "std"]
+        ]
+        + ["pvalue"]
+    )
+    cluster_values = np.c_[features[:35]]
+    cluster_values = np.delete(cluster_values, 2, axis=0)  # delete TEMP
+    np_data = np.array(dataset)
+    np_data = np.delete(np_data, 2, axis=1)  # delete TEMP
+    for cluster in range(optimal_cluster):
+        row_indexes = np.where(kmeans_labels == cluster)[0]
+        cluster_data = np_data[row_indexes, :]
+        # Fill missing values using the median over all patients
+        cluster_mean = np.nanmean(cluster_data, axis=0)
+        cluster_std = np.nanstd(cluster_data, axis=0)
+        cluster_values = np.hstack(
+            (cluster_values, np.c_[cluster_mean], np.c_[cluster_std])
+        )
+    pvalues = [0] * 34
+    cluster_values = np.hstack((cluster_values, np.c_[pvalues]))
+    table_cluster_features = np.vstack((table_cluster_header, cluster_values))
+    return table_cluster_features
 
 
 def main():
@@ -284,50 +330,55 @@ def main():
     sepsis_data = load_and_save.open_pickle("./results/sepsis_cohort.pickle")
     sepsis_patients = load_and_save.open_pickle("./results/sepsis_patients.pickle")
     feature_names = load_and_save.open_txt("./results/features.txt")
-    print("Performing feature extraction...")
+    print("Performing feature extraction for aki and sepsis...")
     aki_extraction, aki_mean, aki_patients = aki_feature_extraction(
         aki_data, aki_patients
     )
     sepsis_extraction, sepsis_mean, sepsis_patients = sepsis_feature_extraction(
         sepsis_data, sepsis_patients
     )
-    # load_and_save.create_csv("./results/aki_extraction.csv", aki_extraction)
-    # load_and_save.create_csv("./results/aki_mean.csv", aki_mean)
-    # load_and_save.create_csv("./results/sepsis_extraction.csv", sepsis_extraction)
-    # load_and_save.create_csv("./results/sepsis_mean.csv", sepsis_mean)
-    print("Identifying optimal number of clusters...")
+    load_and_save.create_csv("./results/aki_extraction.csv", aki_extraction)
+    load_and_save.create_csv("./results/aki_mean.csv", aki_mean)
+    load_and_save.create_csv("./results/sepsis_extraction.csv", sepsis_extraction)
+    load_and_save.create_csv("./results/sepsis_mean.csv", sepsis_mean)
+    print("Identifying optimal number of clusters for aki...")
     (
         aki_cluster_optimal,
         aki_index_table,
     ) = aki_identify_clusters(aki_extraction)
     load_and_save.create_csv("./results/aki_index.csv", aki_index_table)
-    # (
-    #     sepsis_cluster_optimal,
-    #     sespis_index_table,
-    # ) = sepsis_identify_clusters(sepsis_extraction)
-    # load_and_save.create_csv("./results/sepsis_index.csv", sespis_index_table)
-    print("Performing kmeans on clusters...")
+    print("Identifying optimal number of clusters for sepsis...")
+    (
+        sepsis_cluster_optimal,
+        sepsis_distance_matrix,
+        sespis_index_table,
+    ) = sepsis_identify_clusters(sepsis_extraction)
+    load_and_save.create_csv("./results/sepsis_index.csv", sespis_index_table)
+    print("Performing kmeans on aki clusters...")
     (
         aki_kmeans_labels,
         aki_cluster_table,
     ) = aki_kmeans_clusters(aki_extraction, aki_patients, aki_cluster_optimal)
     load_and_save.create_csv("./results/aki_clusters.csv", aki_cluster_table)
-    # (
-    #     sepsis_agglomerative_labels,
-    #     sepsis_cluster_table,
-    # ) = sepsis_agglomerative_clusters(
-    #     sepsis_extraction, sepsis_patients, sepsis_cluster_optimal
-    # )
-    # load_and_save.create_csv("./results/sepsis_clusters.csv", sepsis_cluster_table)
+    print("Performing agglomerative clustering on sepsis clusters...")
+    (
+        sepsis_agglomerative_labels,
+        sepsis_cluster_table,
+    ) = sepsis_agglomerative_clusters(
+        sepsis_distance_matrix, sepsis_patients, sepsis_cluster_optimal
+    )
+    load_and_save.create_csv("./results/sepsis_clusters.csv", sepsis_cluster_table)
     print("Performing statistical analysis on clusters...")
-    table_cluster_features = aki_statistical_analysis(
+    aki_cluster_features = aki_statistical_analysis(
         aki_mean, feature_names, aki_kmeans_labels, aki_cluster_optimal
     )
-    load_and_save.create_csv(
-        "./results/aki_cluster_features.csv", table_cluster_features
+    load_and_save.create_csv("./results/aki_cluster_features.csv", aki_cluster_features)
+    sepsis_cluster_features = sepsis_statistical_analysis(
+        sepsis_mean, feature_names, sepsis_agglomerative_labels, sepsis_cluster_optimal
     )
-    # sepsis_statistical_analysis()
-
+    load_and_save.create_csv(
+        "./results/sepsis_cluster_features.csv", sepsis_cluster_features
+    )
     print("Done. File is saved in results directory.")
 
 
