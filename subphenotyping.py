@@ -3,9 +3,11 @@ import load_and_save
 import numpy as np
 from scipy import stats
 import pandas as pd
+import matplotlib.pyplot as plt
 import warnings
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.cluster import KMeans, AgglomerativeClustering
+from sklearn.manifold import TSNE
 from tslearn.metrics import dtw
 import rpy2.robjects as ro
 from rpy2.robjects.packages import importr
@@ -26,7 +28,7 @@ def convert_rvector(vec):
 
 def replace_outliers(group, stds):
     # set to np.nan for zero values.
-    group[np.abs(group - group.mean()) > stds * group.std()] = np.nan
+    group[np.abs(group - group.mean(axis=0)) > stds * group.std(axis=0)] = np.nan
     return group
 
 
@@ -36,6 +38,72 @@ def fill_nan_median(dataset):
     inds = np.where(np.isnan(dataset))
     dataset[inds] = np.take(col_median, inds[1])
     return dataset
+
+
+def get_feature_stats(dataset: np.ndarray, kmeans_labels: list, total_clusters: int):
+    # test to see if the data is not normally distribuited
+    _, f = dataset.shape
+    values = np.empty((f, total_clusters * 2 + 1))
+    for i in range(f):
+        normal = True
+        shapiro_test = stats.shapiro(dataset[:, i])
+        if shapiro_test.pvalue < 0.05:
+            normal = False
+        all_cluster_data = []
+        feature_stats = []
+        for c in range(total_clusters):
+            row_indexes = np.where(kmeans_labels == c)[0]
+            cluster_data = dataset[row_indexes, i].flatten()
+            feature_stats.append(np.nanmean(cluster_data))  # mean
+            feature_stats.append(np.nanstd(cluster_data))  # std
+            all_cluster_data.append(cluster_data)
+        if total_clusters == 2:  # only two clusters:
+            if normal:
+                t_test = stats.ttest_ind(*all_cluster_data)
+                feature_stats.append(t_test.pvalue)
+            else:
+                mwu_test = stats.mannwhitneyu(*all_cluster_data)
+                feature_stats.append(mwu_test.pvalue)
+        else:  # more than two clusters
+            if normal:
+                anova_test = stats.f_oneway(*all_cluster_data)
+                feature_stats.append(anova_test.pvalue)
+            else:
+                kruskal_test = stats.kruskal(*all_cluster_data)
+                feature_stats.append(kruskal_test.pvalue)
+        values[i] = feature_stats
+    return values
+
+
+def visualize_aki_clusters(dataset: list, labels: list, total_clusters: list):
+    np_data = np.array(dataset, dtype=np.float64)
+    # Normalize data
+    np_data_scaled = MinMaxScaler().fit_transform(np_data)
+    result = TSNE(n_components=2, init="pca", random_state=42).fit_transform(
+        np_data_scaled
+    )
+    colors = ["blue", "orange", "green", "red", "purple", "brown", "pink", "cyan"]
+    for c in range(total_clusters):
+        cluster_data = result[np.where(labels == c)]
+        plt.scatter(cluster_data[:, 0], cluster_data[:, 1], c=colors[c])
+        # plt.plot(center[c, 0], center[c, 1], "kx")
+    plt.savefig("./results/aki_clusters.jpeg")
+    plt.clf()
+
+
+def visualize_sepsis_clusters(dataset: list, labels: list, total_clusters: int):
+    np_data = np.array(dataset)
+    # maximum of 8 possible clusters, so possible colors
+    colors = ["blue", "orange", "green", "red", "purple", "brown", "pink", "cyan"]
+    for c in range(total_clusters):
+        cluster_data = np_data[np.where(labels == c)]
+        n = len(cluster_data)
+        m, se = np.mean(cluster_data, axis=0), stats.sem(cluster_data, axis=0)
+        h = se * stats.t.ppf((1 + 0.95) / 2.0, n - 1)
+        plt.plot(range(1, 73), m, color=colors[c])
+        plt.fill_between(range(72), m - h, m + h, color=colors[c], alpha=0.25)
+    plt.savefig("./results/sepsis_trajectories.jpeg")
+    plt.clf()
 
 
 def aki_feature_extraction(dataset: list, patients: list):
@@ -91,6 +159,7 @@ def aki_feature_extraction(dataset: list, patients: list):
     features_mean_removed = features_mean[~row_indexes]
     patients_outliers_removed = np_patients[~row_indexes]
     patients_outliers_removed = patients_outliers_removed.tolist()
+    print("Total AKI Patients: ", len(patients_outliers_removed))
     return features_outliers_removed, features_mean_removed, patients_outliers_removed
 
 
@@ -129,6 +198,7 @@ def aki_identify_clusters(dataset: list):
     num_clusters.append(majority)
     values = np.hstack((np.c_[indexes], np.c_[num_clusters]))
     table_index = np.vstack((["index", "num_clusters"], values))
+    print("AKI Majority Vote Clusters: ", majority)
     return majority, table_index
 
 
@@ -150,7 +220,11 @@ def aki_kmeans_clusters(dataset: list, patients: list, optimal_majority: int):
             else:
                 row.append(0)
         table_clusters.append(row)
-    return kmeans_labels, table_clusters
+    table_clusters = np.array(table_clusters)
+    totals = np.sum(table_clusters[1:, 1:].astype(int), axis=0)
+    print("Cluster Totals: ", totals)
+    table_clusters = np.vstack((table_clusters, np.concatenate((["total"], totals))))
+    return kmeans_labels, kmeans.cluster_centers_, table_clusters
 
 
 def aki_statistical_analysis(
@@ -159,8 +233,7 @@ def aki_statistical_analysis(
     kmeans_labels: list,
     optimal_cluster: int,
 ):
-
-    table_cluster_header = (
+    table_header = (
         ["feature"]
         + [
             "cluster_" + str(x) + "_" + y
@@ -169,21 +242,13 @@ def aki_statistical_analysis(
         ]
         + ["pvalue"]
     )
-    cluster_values = np.c_[features[:35]]
     np_data = np.array(dataset)
-    for cluster in range(optimal_cluster):
-        row_indexes = np.where(kmeans_labels == cluster)[0]
-        cluster_data = np_data[row_indexes, :]
-        # Fill missing values using the median over all patients
-        cluster_mean = np.nanmean(cluster_data, axis=0)
-        cluster_std = np.nanstd(cluster_data, axis=0)
-        cluster_values = np.hstack(
-            (cluster_values, np.c_[cluster_mean], np.c_[cluster_std])
-        )
-    pvalues = [0] * 35
-    cluster_values = np.hstack((cluster_values, np.c_[pvalues]))
-    table_cluster_features = np.vstack((table_cluster_header, cluster_values))
-    return table_cluster_features
+    values = get_feature_stats(np_data, kmeans_labels, optimal_cluster)
+    f_values = np.hstack((np.c_[features[:35]], values))
+    # return only features that have a significant pvalue
+    sig_only = f_values[f_values[:, -1].astype(np.float64) < 0.05]
+    table = np.vstack((table_header, sig_only))
+    return table
 
 
 def sepsis_feature_extraction(dataset: list, patients: list):
@@ -192,10 +257,14 @@ def sepsis_feature_extraction(dataset: list, patients: list):
     features_temp[:] = np.nan
     for i, patient_data in enumerate(dataset):
         np_patient_data = np.array(patient_data, dtype=np.float64)
+        ICULOS = np_patient_data[39]
         np_patient_data = np_patient_data[:35, :]
-        temp_data = np_patient_data[2][:72]
+        temp_data = np_patient_data[2]
         for j, ele in enumerate(temp_data):
-            features_temp[i, j] = ele
+            hour = int(ICULOS[j])
+            features_temp[i, hour - 1] = ele
+            if hour >= 72:
+                break
         features_mean[i] = np.nanmean(np_patient_data, axis=1)
     features_mean = fill_nan_median(features_mean)
     df = pd.DataFrame(features_temp)
@@ -208,6 +277,7 @@ def sepsis_feature_extraction(dataset: list, patients: list):
     features_mean_removed = features_mean[~row_indexes]
     patients_novalues_removed = np_patients[~row_indexes]
     patients_novalues_removed = patients_novalues_removed.tolist()
+    print("Total Sepsis Patients: ", len(patients_novalues_removed))
     return features_temp_removed, features_mean_removed, patients_novalues_removed
 
 
@@ -217,9 +287,9 @@ def sepsis_identify_clusters(dataset: list):
     for i, temps_i in enumerate(dataset):
         for j, temps_j in enumerate(dataset):
             dtw_matrix[i, j] = dtw(temps_i, temps_j)
-    load_and_save.create_csv("./results/distance_matrix.csv", dtw_matrix)
+    load_and_save.create_csv("./results/sepsis_distances.csv", dtw_matrix)
 
-    # dtw_matrix = load_and_save.read_csv("./results/distance_matrix.csv", False)
+    # dtw_matrix = load_and_save.read_csv("./results/sepsis_distances.csv", False)
     # dtw_matrix = np.array(dtw_matrix, dtype=np.float64)
     indexes = [
         "ptbiserial",
@@ -261,6 +331,7 @@ def sepsis_identify_clusters(dataset: list):
     num_clusters.append(majority)
     values = np.hstack((np.c_[indexes], np.c_[num_clusters]))
     table = np.vstack((["index", "num_clusters"], values))
+    print("Sepsis Majority Vote Clusters: ", majority)
     return (
         majority,
         dtw_matrix,
@@ -285,6 +356,10 @@ def sepsis_agglomerative_clusters(
             else:
                 row.append(0)
         table_clusters.append(row)
+    table_clusters = np.array(table_clusters)
+    totals = np.sum(table_clusters[1:, 1:].astype(int), axis=0)
+    print("Cluster Totals: ", totals)
+    table_clusters = np.vstack((table_clusters, np.concatenate((["total"], totals))))
     return agglomerative_labels, table_clusters
 
 
@@ -294,8 +369,7 @@ def sepsis_statistical_analysis(
     kmeans_labels: list,
     optimal_cluster: int,
 ):
-
-    table_cluster_header = (
+    table_header = (
         ["feature"]
         + [
             "cluster_" + str(x) + "_" + y
@@ -308,19 +382,14 @@ def sepsis_statistical_analysis(
     cluster_values = np.delete(cluster_values, 2, axis=0)  # delete TEMP
     np_data = np.array(dataset)
     np_data = np.delete(np_data, 2, axis=1)  # delete TEMP
-    for cluster in range(optimal_cluster):
-        row_indexes = np.where(kmeans_labels == cluster)[0]
-        cluster_data = np_data[row_indexes, :]
-        # Fill missing values using the median over all patients
-        cluster_mean = np.nanmean(cluster_data, axis=0)
-        cluster_std = np.nanstd(cluster_data, axis=0)
-        cluster_values = np.hstack(
-            (cluster_values, np.c_[cluster_mean], np.c_[cluster_std])
-        )
-    pvalues = [0] * 34
-    cluster_values = np.hstack((cluster_values, np.c_[pvalues]))
-    table_cluster_features = np.vstack((table_cluster_header, cluster_values))
-    return table_cluster_features
+    values = get_feature_stats(np_data, kmeans_labels, optimal_cluster)
+    f_names = np.c_[features[:35]]
+    f_names = np.delete(f_names, 2, axis=0)  # delete TEMP
+    f_values = np.hstack((f_names, values))
+    # return only features that have a significant pvalue
+    sig_only = f_values[f_values[:, -1].astype(np.float64) < 0.05]
+    table = np.vstack((table_header, sig_only))
+    return table
 
 
 def main():
@@ -337,10 +406,10 @@ def main():
     sepsis_extraction, sepsis_mean, sepsis_patients = sepsis_feature_extraction(
         sepsis_data, sepsis_patients
     )
-    load_and_save.create_csv("./results/aki_extraction.csv", aki_extraction)
-    load_and_save.create_csv("./results/aki_mean.csv", aki_mean)
-    load_and_save.create_csv("./results/sepsis_extraction.csv", sepsis_extraction)
-    load_and_save.create_csv("./results/sepsis_mean.csv", sepsis_mean)
+    # load_and_save.create_csv("./results/aki_extraction.csv", aki_extraction)
+    # load_and_save.create_csv("./results/aki_mean.csv", aki_mean)
+    # load_and_save.create_csv("./results/sepsis_extraction.csv", sepsis_extraction)
+    # load_and_save.create_csv("./results/sepsis_mean.csv", sepsis_mean)
     print("Identifying optimal number of clusters for aki...")
     (
         aki_cluster_optimal,
@@ -357,9 +426,11 @@ def main():
     print("Performing kmeans on aki clusters...")
     (
         aki_kmeans_labels,
+        aki_kmeans_centroids,
         aki_cluster_table,
     ) = aki_kmeans_clusters(aki_extraction, aki_patients, aki_cluster_optimal)
     load_and_save.create_csv("./results/aki_clusters.csv", aki_cluster_table)
+    visualize_aki_clusters(aki_extraction, aki_kmeans_labels, aki_cluster_optimal)
     print("Performing agglomerative clustering on sepsis clusters...")
     (
         sepsis_agglomerative_labels,
@@ -368,6 +439,9 @@ def main():
         sepsis_distance_matrix, sepsis_patients, sepsis_cluster_optimal
     )
     load_and_save.create_csv("./results/sepsis_clusters.csv", sepsis_cluster_table)
+    visualize_sepsis_clusters(
+        sepsis_extraction, sepsis_agglomerative_labels, sepsis_cluster_optimal
+    )
     print("Performing statistical analysis on clusters...")
     aki_cluster_features = aki_statistical_analysis(
         aki_mean, feature_names, aki_kmeans_labels, aki_cluster_optimal

@@ -3,6 +3,7 @@
 Subphenotyping using EHR data
 
 ## Setup
+You need to have Python 3.8 or later and R 4.1.3 installed
 ```
 pip install -r requirements.txt
 ```
@@ -25,3 +26,24 @@ flake8
 ```
 
 ## Programs to run in order for disease phenotyping of AKI / Sepsis
+```
+python construct_cohort.py
+python get_distributions.py
+python subphenotyping.py
+```
+The following files will be created in `./results` after running the three scripts
+1. aki_cluster_features.csv
+2. aki_clusters.csv
+3. aki_clusters.jpeg
+4. aki_cohort.pickle
+5. aki_features.csv
+6. aki_index.csv
+7. aki_patients.pickle
+8. features.txt
+9. sepsis_cluster_features.csv
+10. sepsis_custers.csv
+11. sepsis_cohort.pickle
+12. sepsis_features.csv
+13. sepsis_index.csv
+14. sepsis_patients.pickle
+15. sepsis_trajectories.jpeg
